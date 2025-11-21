@@ -1,0 +1,170 @@
+import my_function
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import random
+
+
+# --- 1. 模型定义 ---
+class MyModel(nn.Module):
+    def __init__(self, input_shape, num_big_classes):
+        super(MyModel, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=input_shape[0], out_channels=16, kernel_size=3, stride=1, padding=1)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.flatten = nn.Flatten()
+        self.dropout = nn.Dropout(0.5)
+        self.fc = nn.Linear(32 * (input_shape[1] // 4) * (input_shape[2] // 4), num_big_classes)
+
+    def forward(self, x):
+        x = self.pool1(F.relu(self.conv1(x)))
+        x = self.pool2(F.relu(self.conv2(x)))
+        x = self.flatten(x)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+
+# --- 2. 训练函数 (修改以接受固定种子和可变Epoch) ---
+def train_single_model(model_name, train_loader, test_loader, device, num_epochs, fixed_seed, lr):
+    """
+    使用固定的随机种子和指定的Epoch数训练模型
+    """
+    print(f"\n开始训练模型: {model_name}")
+    print(f"设置: Epochs={num_epochs}, Seed={fixed_seed}")
+    
+    # 每次训练前强制设置相同的种子, 保证状态一致
+    my_function.set_seed(fixed_seed)
+    
+    model = MyModel(input_shape=(3, 32, 32), num_big_classes=10).to(device)
+    
+    # 权重初始化
+    def init_weights(m):
+        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+    
+    model.apply(init_weights)
+    
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    
+    # 创建记录器
+    logger = my_function.TrainingLogger( 
+        model_name=model_name
+    )
+    
+    best_val_acc = 0.0
+    
+    for epoch in range(num_epochs):
+        # 训练阶段
+        model.train()
+        total_loss = 0.0
+        train_correct = 0
+        train_total = 0
+
+        for inputs, labels in train_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * inputs.size(0)
+            _, predicted = torch.max(outputs.data, 1)
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
+
+        train_acc = train_correct / train_total
+        avg_loss = total_loss / train_total
+
+        # 验证阶段
+        model.eval()
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for inputs, labels in test_loader:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                outputs = model(inputs)
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+
+        val_acc = val_correct / val_total
+        
+        # 记录最佳验证准确率
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+        
+        # 更新记录
+        logger.update(epoch + 1, avg_loss, train_acc, val_acc)
+
+        # 减少打印频率，每5轮打印一次，或者最后一轮打印
+        if (epoch + 1) % 5 == 0 or (epoch + 1) == num_epochs:
+            print(f'{model_name} - Epoch [{epoch + 1}/{num_epochs}] - Loss: {avg_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}')
+
+    return model, logger, best_val_acc
+
+
+# --- 3. 主程序 ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# 加载数据 (使用 my_function 中的 load_data_cifar10，不需要 resize)
+train_loader, test_loader = my_function.load_data_cifar10(batch_size=256)
+
+# === 实验设置 ===
+FIXED_SEED = 42             # 固定种子，保证两次实验的起点一致
+epochs = 50
+lr_setting = [0.1, 0.001, 0.00001]
+results = []
+
+# === 循环不同的 Epoch 设置 ===
+for lr in lr_setting:
+    model_name = f"MyModel_Lr_{lr}"
+    
+    model, logger, best_val_acc = train_single_model(
+        model_name=model_name,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        device=device,
+        num_epochs=epochs,   # 传入当前循环的 epoch 数
+        fixed_seed=FIXED_SEED,
+        lr = lr
+    )
+    
+    results.append({
+        'epochs': epochs,
+        'name': model_name,
+        'model': model,
+        'logger': logger,
+        'best_val_acc': best_val_acc
+    })
+    print(f"完成 {model_name} 训练。最佳验证准确率: {best_val_acc:.4f}\n")
+    logger.plot_training_curves(save_dir=f"./result/{model_name}", save=True)
+
+
+# === 结果分析 ===
+print("=" * 15, "Epochs 延展实验对比", "=" * 15)
+for result in results:
+    print(f"设置 Epochs={result['epochs']}: 最佳验证准确率 = {result['best_val_acc']:.4f}")
+    # 打印每个设置的最终训练摘要
+    # result['logger'].print_summary() 
+
+# 找到表现最好的设置
+best_result = max(results, key=lambda x: x['best_val_acc'])
+print(f"\n最佳实验设置: Epochs={best_result['epochs']} (准确率: {best_result['best_val_acc']:.4f})")
+
+# # 为最佳模型绘制训练曲线
+# print(f"\n为最佳模型 {best_result['name']} 绘制训练曲线并保存...")
+# best_result['logger'].plot_training_curves(save_dir=f"./result/{model_name}", save=True)
